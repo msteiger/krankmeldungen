@@ -10,323 +10,257 @@ from email.message import EmailMessage
 from datetime import datetime
 from pathlib import Path
 
-try:
-    from openpyxl import load_workbook
-except ImportError:
-    raise SystemExit("Bitte zuerst installieren: python -m pip install openpyxl")
+from cryptography.fernet import Fernet, InvalidToken
+from openpyxl import load_workbook
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = APP_DIR / "mail_config.json"
-WEEKDAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]
+KEY_FILE = APP_DIR / "smtp_key.key"
+DEFAULT_BOOK = APP_DIR / "Mailplanung_Vorlage_inhalt.xlsx"
+WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+LOG_HEADERS = ("Datum", "Uhrzeit", "Wochentag", "Jahrgang", "Anzahl Personen", "Hauptempfänger (An)", "CC-Empfänger", "Versandstatus", "Fehlermeldung")
 
-DEFAULT_CONFIG = {
-    "smtp_server": "mail.gmx.net",
-    "smtp_port": 587,
-    "sender": "",
-    "username": "",
-    "to_address": "",
-    "use_starttls": True
-}
+
+def local_weekday(now=None):
+    return WEEKDAYS[(now or datetime.now()).weekday()]
+
+
+def ensure_recipient_sheet(workbook):
+    """Create the fixed To-address sheet and add newly seen years without touching addresses."""
+    if "Jahrgangsempfaenger" not in workbook.sheetnames:
+        ws = workbook.create_sheet("Jahrgangsempfaenger")
+        ws.append(("Jahrgang", "E-Mail-Adresse"))
+    ws = workbook["Jahrgangsempfaenger"]
+    if ws.max_row == 0 or ws.cell(1, 1).value is None:
+        ws.cell(1, 1, "Jahrgang")
+        ws.cell(1, 2, "E-Mail-Adresse")
+    existing = {str(ws.cell(r, 1).value).strip() for r in range(2, ws.max_row + 1) if ws.cell(r, 1).value is not None}
+    people = workbook["Personen"]
+    for row in people.iter_rows(min_row=2, min_col=3, max_col=3, values_only=True):
+        year = str(row[0]).strip() if row[0] is not None else ""
+        if year and year not in existing:
+            ws.append((year, None))
+            existing.add(year)
+    return ws
+
+
+def read_mail_data(path, years=()):
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError("Die ausgewählte Excel-Datei wurde nicht gefunden.")
+    wb = load_workbook(path)
+    for sheet in ("Personen", "Inhalt", "Empfaenger", "Protokoll"):
+        if sheet not in wb.sheetnames:
+            raise ValueError(f"Das Tabellenblatt '{sheet}' fehlt in der Excel-Datei.")
+    to_ws = ensure_recipient_sheet(wb)
+    if wb["Protokoll"].max_row == 0 or wb["Protokoll"].cell(1, 1).value is None:
+        for col, header in enumerate(LOG_HEADERS, 1):
+            wb["Protokoll"].cell(1, col, header)
+    people = []
+    for row_no, row in enumerate(wb["Personen"].iter_rows(min_row=2, min_col=1, max_col=3, values_only=True), 2):
+        first, last, year = row
+        if first is None and last is None and year is None:
+            continue
+        if not all(v is not None and str(v).strip() for v in (first, last, year)):
+            raise ValueError(f"Ungültiger Personendatensatz in 'Personen', Zeile {row_no}: Vorname, Nachname und Jahrgang sind erforderlich.")
+        people.append({"id": row_no, "first": str(first).strip(), "last": str(last).strip(), "year": str(year).strip()})
+    content = next(((str(a).strip(), str(b)) for a, b in wb["Inhalt"].iter_rows(min_row=2, min_col=1, max_col=2, values_only=True) if a and b), None)
+    if not content:
+        raise ValueError("Im Tabellenblatt 'Inhalt' fehlt eine Zeile mit Betreff und Nachricht.")
+    cc = {}
+    for day, year, address in wb["Empfaenger"].iter_rows(min_row=2, min_col=1, max_col=3, values_only=True):
+        if day and year and address:
+            cc[(str(day).strip(), str(year).strip())] = str(address).strip()
+    to = {str(to_ws.cell(r, 1).value).strip(): str(to_ws.cell(r, 2).value).strip()
+          for r in range(2, to_ws.max_row + 1) if to_ws.cell(r, 1).value and to_ws.cell(r, 2).value}
+    wb.save(path)
+    return people, content[0], content[1], to, cc
+
+
+def load_smtp_config():
+    if not CONFIG_FILE.is_file():
+        raise ValueError("SMTP-Konfiguration fehlt. Bitte zuerst SMTP_Einrichten.bat ausführen.")
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+        required = ("smtp_server", "smtp_port", "sender", "username", "password_encrypted")
+        if any(not cfg.get(k) for k in required):
+            raise ValueError
+        if not KEY_FILE.is_file():
+            raise ValueError
+        password = Fernet(KEY_FILE.read_bytes()).decrypt(cfg["password_encrypted"].encode()).decode()
+        return cfg, password
+    except (OSError, ValueError, KeyError, InvalidToken, json.JSONDecodeError, TypeError):
+        raise ValueError("SMTP-Konfiguration oder Schlüsseldatei fehlt oder ist ungültig. Bitte SMTP_Einrichten.bat erneut ausführen.") from None
+
+
+def grouped_messages(selected, subject, template, to, cc, day):
+    groups = {}
+    for person in selected:
+        groups.setdefault(person["year"], []).append(person)
+    result = []
+    for year in sorted(groups, key=str.casefold):
+        people = sorted(groups[year], key=lambda p: (p["last"].casefold(), p["first"].casefold()))
+        result.append({"year": year, "count": len(people), "to": to.get(year, ""),
+                       "cc": cc.get((day, year), ""), "subject": subject,
+                       "body": template.replace("{PERSONEN}", ", ".join(p["first"] + " " + p["last"] for p in people)).replace("{JAHRGANG}", year)})
+    return result
+
+
+def validate_messages(messages):
+    missing = []
+    for m in messages:
+        if not m["to"]:
+            missing.append(f"Jahrgang {m['year']}: Hauptempfänger (An) fehlt.")
+        if not m["cc"]:
+            missing.append(f"Jahrgang {m['year']}: CC-Adresse für den aktuellen Wochentag fehlt.")
+    if missing:
+        raise ValueError("Versand nicht möglich:\n" + "\n".join(missing))
+
 
 class MailPlanApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Mailplanung – Krankmeldungen")
-        self.root.geometry("1120x760")
-        self.root.minsize(900, 650)
-        self.people = []
-        self.selected = {}
-        self.workbook_path = tk.StringVar(value=str(APP_DIR / "Mailplanung_Vorlage_inhalt.xlsx"))
-        self.weekday = tk.StringVar(value=WEEKDAYS[datetime.now().weekday()] if datetime.now().weekday() < 5 else "Montag")
+        root.title("Mailplanung – Krankmeldungen")
+        root.geometry("1100x760")
+        root.minsize(850, 620)
+        self.people, self.selected, self.visible_people = [], {}, []
+        self.path = tk.StringVar(value=str(DEFAULT_BOOK))
         self.search = tk.StringVar()
-        self.smtp = self.load_config()
-        self.status = tk.StringVar(value="Bitte Excel-Datei laden.")
+        self.status = tk.StringVar(value="Excel-Datei wird geladen …")
         self.build_ui()
         self.load_workbook()
 
-    def load_config(self):
-        cfg = DEFAULT_CONFIG.copy()
-        if CONFIG_FILE.exists():
-            try:
-                cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
-            except Exception:
-                pass
-        return cfg
-
-    def save_config(self):
-        cfg = {
-            "smtp_server": self.smtp_server.get().strip(),
-            "smtp_port": int(self.smtp_port.get().strip()),
-            "sender": self.sender.get().strip(),
-            "username": self.username.get().strip(),
-            "to_address": self.to_address.get().strip(),
-            "use_starttls": True
-        }
-        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.smtp = cfg
-
     def build_ui(self):
-        outer = ttk.Frame(self.root, padding=12)
-        outer.pack(fill="both", expand=True)
-
-        filebar = ttk.Frame(outer)
-        filebar.pack(fill="x")
-        ttk.Label(filebar, text="Excel-Datei:").pack(side="left")
-        ttk.Entry(filebar, textvariable=self.workbook_path).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(filebar, text="Durchsuchen…", command=self.choose_file).pack(side="left")
-        ttk.Button(filebar, text="Neu laden", command=self.load_workbook).pack(side="left", padx=(6,0))
-
-        settings = ttk.LabelFrame(outer, text="Versand")
-        settings.pack(fill="x", pady=10)
-        self.smtp_server = tk.StringVar(value=self.smtp.get("smtp_server", "mail.gmx.net"))
-        self.smtp_port = tk.StringVar(value=str(self.smtp.get("smtp_port", 587)))
-        self.sender = tk.StringVar(value=self.smtp.get("sender", ""))
-        self.username = tk.StringVar(value=self.smtp.get("username", ""))
-        self.to_address = tk.StringVar(value=self.smtp.get("to_address", ""))
-        self.password = tk.StringVar()
-        fields = [
-            ("SMTP-Server", self.smtp_server, 22), ("Port", self.smtp_port, 7),
-            ("Absenderadresse", self.sender, 30), ("SMTP-Benutzername", self.username, 24),
-            ("An (Pflichtfeld)", self.to_address, 30), ("SMTP-Passwort", self.password, 20)
-        ]
-        for i, (label, var, width) in enumerate(fields):
-            r, c = divmod(i, 3)
-            cell = ttk.Frame(settings)
-            cell.grid(row=r, column=c, sticky="ew", padx=6, pady=5)
-            ttk.Label(cell, text=label).pack(anchor="w")
-            ent = ttk.Entry(cell, textvariable=var, width=width, show="*" if label == "SMTP-Passwort" else "")
-            ent.pack(fill="x")
-        for c in range(3):
-            settings.columnconfigure(c, weight=1)
-        ttk.Label(settings, text="Das Passwort wird nicht gespeichert; es bleibt nur bis zum Schließen der Anwendung im Arbeitsspeicher.").grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0,5))
-        ttk.Button(settings, text="Einstellungen speichern (ohne Passwort)", command=self.save_settings).grid(row=2, column=2, sticky="e", padx=6, pady=(0,5))
-
-        main = ttk.Frame(outer)
-        main.pack(fill="both", expand=True)
-        left = ttk.LabelFrame(main, text="Personen suchen und auswählen")
-        left.pack(side="left", fill="both", expand=True, padx=(0,6))
-        right = ttk.LabelFrame(main, text="Ausgewählte Personen")
-        right.pack(side="left", fill="both", expand=True, padx=(6,0))
-
-        top = ttk.Frame(left); top.pack(fill="x", padx=8, pady=8)
-        ttk.Label(top, text="Suche (Vorname oder Nachname):").pack(anchor="w")
-        search_entry = ttk.Entry(top, textvariable=self.search)
-        search_entry.pack(fill="x")
+        outer = ttk.Frame(self.root, padding=12); outer.pack(fill="both", expand=True)
+        bar = ttk.Frame(outer); bar.pack(fill="x")
+        ttk.Label(bar, text="Excel-Datei:").pack(side="left")
+        ttk.Entry(bar, textvariable=self.path, state="readonly").pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(bar, text="Datei auswählen", command=self.choose_file).pack(side="left")
+        ttk.Button(bar, text="Neu laden", command=self.load_workbook).pack(side="left", padx=(6, 0))
+        main = ttk.Frame(outer); main.pack(fill="both", expand=True, pady=10)
+        left = ttk.LabelFrame(main, text="Personensuche"); left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right = ttk.LabelFrame(main, text="Ausgewählte Personen"); right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        ttk.Label(left, text="Vorname oder Nachname:").pack(anchor="w", padx=8, pady=(8, 0))
+        ttk.Entry(left, textvariable=self.search).pack(fill="x", padx=8)
         self.search.trace_add("write", lambda *_: self.refresh_people())
-        self.people_list = tk.Listbox(left, selectmode="extended", height=18, exportselection=False)
-        self.people_list.pack(fill="both", expand=True, padx=8, pady=(0,6))
-        ttk.Button(left, text="Markierte hinzufügen →", command=self.add_people).pack(anchor="e", padx=8, pady=8)
-
-        daybar = ttk.Frame(right); daybar.pack(fill="x", padx=8, pady=8)
-        ttk.Label(daybar, text="Wochentag für CC-Empfänger:").pack(side="left")
-        daybox = ttk.Combobox(daybar, textvariable=self.weekday, values=WEEKDAYS, state="readonly", width=14)
-        daybox.pack(side="left", padx=6)
-        daybox.bind("<<ComboboxSelected>>", lambda e: self.update_preview())
-
-        self.selected_list = tk.Listbox(right, height=18, exportselection=False)
-        self.selected_list.pack(fill="both", expand=True, padx=8, pady=(0,6))
-        ttk.Button(right, text="Markierte entfernen", command=self.remove_people).pack(anchor="e", padx=8, pady=8)
-
-        preview_frame = ttk.LabelFrame(outer, text="E-Mail-Vorschau (eine E-Mail pro Jahrgang)")
-        preview_frame.pack(fill="both", expand=True, pady=10)
-        self.preview = tk.Text(preview_frame, height=9, wrap="word")
-        self.preview.pack(fill="both", expand=True, padx=8, pady=8)
-        actions = ttk.Frame(outer); actions.pack(fill="x")
+        self.people_list = tk.Listbox(left, selectmode="extended", exportselection=False); self.people_list.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(left, text="Hinzufügen →", command=self.add_people).pack(anchor="e", padx=8, pady=(0, 8))
+        self.selected_list = tk.Listbox(right, selectmode="extended", exportselection=False); self.selected_list.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(right, text="Markierte entfernen", command=self.remove_people).pack(anchor="e", padx=8, pady=(0, 8))
+        preview_frame = ttk.LabelFrame(outer, text="E-Mail-Vorschau (eine E-Mail pro Jahrgang)"); preview_frame.pack(fill="both", expand=True)
+        self.preview = tk.Text(preview_frame, height=12, wrap="word"); self.preview.pack(fill="both", expand=True, padx=8, pady=8)
+        actions = ttk.Frame(outer); actions.pack(fill="x", pady=(8, 0))
         ttk.Label(actions, textvariable=self.status).pack(side="left", fill="x", expand=True)
         ttk.Button(actions, text="Vorschau aktualisieren", command=self.update_preview).pack(side="right", padx=4)
-        ttk.Button(actions, text="E-Mails senden…", command=self.send_emails).pack(side="right", padx=4)
+        ttk.Button(actions, text="E-Mails senden …", command=self.send_emails).pack(side="right", padx=4)
 
     def choose_file(self):
         p = filedialog.askopenfilename(title="Excel-Datei auswählen", filetypes=[("Excel-Dateien", "*.xlsx")])
         if p:
-            self.workbook_path.set(p)
-            self.load_workbook()
+            self.path.set(p); self.load_workbook()
 
     def load_workbook(self):
-        p = Path(self.workbook_path.get())
-        if not p.exists():
-            self.status.set("Excel-Datei nicht gefunden. Bitte Datei auswählen.")
-            return
         try:
-            wb = load_workbook(p, data_only=True)
-            for sheet in ("Personen", "Inhalt", "Empfaenger", "Protokoll"):
-                if sheet not in wb.sheetnames:
-                    raise ValueError(f"Das Tabellenblatt '{sheet}' fehlt.")
-            ws = wb["Personen"]
-            self.people = []
-            for row_no, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-                first, last, year = (list(row) + [None, None, None])[:3]
-                if first and last and year:
-                    self.people.append({"id": row_no, "first": str(first).strip(), "last": str(last).strip(), "year": str(year).strip()})
-            self.selected.clear()
-            self.refresh_people()
-            self.refresh_selected()
-            self.status.set(f"{len(self.people)} Personen geladen.")
-            self.update_preview()
+            self.people, self.subject, self.template, self.to, self.cc = read_mail_data(self.path.get())
+            self.selected.clear(); self.refresh_people(); self.refresh_selected(); self.update_preview()
+            self.status.set(f"{len(self.people)} Personen geladen. Wochentag: {local_weekday()}.")
         except Exception as e:
+            self.status.set("Excel-Datei konnte nicht geladen werden.")
             messagebox.showerror("Excel-Fehler", str(e))
 
     def refresh_people(self):
-        q = self.search.get().strip().casefold()
-        self.people_list.delete(0, tk.END)
-        self.visible_people = []
+        if not hasattr(self, "people_list"): return
+        q = self.search.get().strip().casefold(); self.people_list.delete(0, tk.END); self.visible_people = []
         for p in self.people:
-            label = f'{p["first"]} {p["last"]}  –  {p["year"]}'
-            if q in label.casefold() and p["id"] not in self.selected:
-                self.visible_people.append(p)
-                self.people_list.insert(tk.END, label)
-
-    def add_people(self):
-        for idx in self.people_list.curselection():
-            p = self.visible_people[idx]
-            self.selected[p["id"]] = p
-        self.refresh_people()
-        self.refresh_selected()
-        self.update_preview()
+            if p["id"] not in self.selected and q in (p["first"] + " " + p["last"] + " " + p["year"]).casefold():
+                self.visible_people.append(p); self.people_list.insert(tk.END, f'{p["first"]} {p["last"]} — {p["year"]}')
 
     def refresh_selected(self):
+        if not hasattr(self, "selected_list"): return
         self.selected_list.delete(0, tk.END)
         self.visible_selected = sorted(self.selected.values(), key=lambda p: (p["year"].casefold(), p["last"].casefold(), p["first"].casefold()))
-        for p in self.visible_selected:
-            self.selected_list.insert(tk.END, f'{p["year"]}: {p["first"]} {p["last"]}')
+        for p in self.visible_selected: self.selected_list.insert(tk.END, f'{p["year"]}: {p["first"]} {p["last"]}')
+
+    def add_people(self):
+        for i in self.people_list.curselection():
+            p = self.visible_people[i]; self.selected[p["id"]] = p
+        self.refresh_people(); self.refresh_selected(); self.update_preview()
 
     def remove_people(self):
-        for idx in reversed(self.selected_list.curselection()):
-            p = self.visible_selected[idx]
-            self.selected.pop(p["id"], None)
-        self.refresh_people()
-        self.refresh_selected()
-        self.update_preview()
+        for i in reversed(self.selected_list.curselection()): self.selected.pop(self.visible_selected[i]["id"], None)
+        self.refresh_people(); self.refresh_selected(); self.update_preview()
 
-    def get_mail_data(self):
-        wb = load_workbook(self.workbook_path.get(), data_only=True)
-        content_ws = wb["Inhalt"]
-        subject = body = None
-        for row in content_ws.iter_rows(min_row=2, values_only=True):
-            if row[0] and row[1]:
-                subject, body = str(row[0]), str(row[1])
-                break
-        if not subject or not body:
-            raise ValueError("Im Tabellenblatt 'Inhalt' fehlt eine Zeile mit Betreff und Nachricht.")
-        recipients = {}
-        for row in wb["Empfaenger"].iter_rows(min_row=2, values_only=True):
-            day, year, email = (list(row) + [None, None, None])[:3]
-            if day and year and email:
-                recipients[(str(day).strip(), str(year).strip())] = str(email).strip()
-        return subject, body, recipients
-
-    def build_messages(self):
-        subject, template, recipients = self.get_mail_data()
-        groups = {}
-        for p in self.selected.values():
-            groups.setdefault(p["year"], []).append(p)
-        result = []
-        for year in sorted(groups, key=str.casefold):
-            names = ", ".join(f'{p["first"]} {p["last"]}' for p in sorted(groups[year], key=lambda p: (p["last"].casefold(), p["first"].casefold())))
-            body = template.replace("{PERSONEN}", names).replace("{JAHRGANG}", year)
-            cc = recipients.get((self.weekday.get(), year), "")
-            result.append({"year": year, "subject": subject, "body": body, "cc": cc, "count": len(groups[year])})
-        return result
+    def messages(self):
+        # Determine weekday at preview/send time from the local system clock.
+        return grouped_messages(self.selected.values(), self.subject, self.template, self.to, self.cc, local_weekday())
 
     def update_preview(self):
+        if not hasattr(self, "preview"): return
         self.preview.delete("1.0", tk.END)
         if not self.selected:
-            self.preview.insert(tk.END, "Noch keine Personen ausgewählt.\n")
-            return
+            self.preview.insert(tk.END, "Noch keine Personen ausgewählt.\n"); return
         try:
-            messages = self.build_messages()
-            for m in messages:
-                self.preview.insert(tk.END, f'Jahrgang {m["year"]} – {m["count"]} Person(en)\n')
-                self.preview.insert(tk.END, f'An: {self.to_address.get().strip() or "(bitte An-Adresse eintragen)"}\n')
-                self.preview.insert(tk.END, f'CC: {m["cc"] or "(kein CC-Empfänger in Excel hinterlegt)"}\n')
-                self.preview.insert(tk.END, f'Betreff: {m["subject"]}\n{m["body"]}\n')
-                self.preview.insert(tk.END, "—" * 55 + "\n")
-        except Exception as e:
-            self.preview.insert(tk.END, f"Vorschau nicht möglich: {e}\n")
-
-    def save_settings(self):
-        try:
-            self.save_config()
-            self.status.set("Einstellungen gespeichert (Passwort nicht gespeichert).")
-        except Exception as e:
-            messagebox.showerror("Einstellungen", str(e))
+            for m in self.messages():
+                self.preview.insert(tk.END, f'Jahrgang {m["year"]} – {m["count"]} Person(en)\nAn: {m["to"] or "(fehlt)"}\nCC: {m["cc"] or "(fehlt)"}\nBetreff: {m["subject"]}\n{m["body"]}\n' + "─" * 55 + "\n")
+        except Exception as e: self.preview.insert(tk.END, f"Vorschau nicht möglich: {e}\n")
 
     def log_result(self, entries):
-        p = Path(self.workbook_path.get())
-        wb = load_workbook(p)
-        ws = wb["Protokoll"]
+        wb = load_workbook(self.path.get()); ws = wb["Protokoll"]
+        if ws.cell(1, 1).value is None:
+            for col, header in enumerate(LOG_HEADERS, 1): ws.cell(1, col, header)
         for entry in entries:
-            row = ws.max_row + 1
-            ws.cell(row, 1, datetime.now().strftime("%d.%m.%Y"))
-            ws.cell(row, 2, datetime.now().strftime("%H:%M:%S"))
-            ws.cell(row, 3, self.weekday.get())
-            ws.cell(row, 4, entry["year"])
-            ws.cell(row, 5, entry["count"])
-            ws.cell(row, 6, entry["cc"])
-            ws.cell(row, 7, entry["status"])
-            ws.cell(row, 8, entry["error"])
-        wb.save(p)
+            now = datetime.now(); row = ws.max_row + 1
+            values = (now.strftime("%d.%m.%Y"), now.strftime("%H:%M:%S"), entry["day"], entry["year"], entry["count"], entry["to"], entry["cc"], entry["status"], entry["error"])
+            for col, value in enumerate(values, 1): ws.cell(row, col, value)
+        wb.save(self.path.get())
 
     def send_emails(self):
         if not self.selected:
-            messagebox.showwarning("Keine Auswahl", "Bitte zuerst Personen auswählen.")
-            return
+            messagebox.showwarning("Keine Auswahl", "Bitte zuerst Personen auswählen."); return
+        log = []
         try:
-            messages = self.build_messages()
-            to_addr = self.to_address.get().strip()
-            sender = self.sender.get().strip()
-            username = self.username.get().strip()
-            password = self.password.get()
-            server = self.smtp_server.get().strip()
-            port = int(self.smtp_port.get().strip())
-            if not all([to_addr, sender, username, password, server]):
-                raise ValueError("Bitte An-Adresse, Absenderadresse, SMTP-Benutzername, SMTP-Passwort und SMTP-Server ausfüllen.")
-            for m in messages:
-                if not m["cc"]:
-                    raise ValueError(f"Für Jahrgang {m['year']} ist am {self.weekday.get()} keine CC-Adresse im Blatt 'Empfaenger' hinterlegt.")
-            summary = "\n".join(f'{m["year"]}: {m["count"]} Person(en), CC: {m["cc"]}' for m in messages)
+            messages = self.messages(); validate_messages(messages)
+            cfg, password = load_smtp_config()
+            summary = "\n".join(f'{m["year"]}: An {m["to"]}; CC {m["cc"]}' for m in messages)
             if not messagebox.askyesno("Versand bestätigen", f"Es werden {len(messages)} E-Mail(s) versendet:\n\n{summary}\n\nMöchtest du wirklich senden?"):
                 return
-            log = []
-            context = ssl.create_default_context()
-            with smtplib.SMTP(server, port, timeout=30) as smtp:
-                smtp.ehlo()
-                smtp.starttls(context=context)
-                smtp.ehlo()
-                smtp.login(username, password)
-                for m in messages:
-                    msg = EmailMessage()
-                    msg["From"] = sender
-                    msg["To"] = to_addr
-                    msg["Cc"] = m["cc"]
-                    msg["Subject"] = m["subject"]
-                    msg.set_content(m["body"])
-                    try:
-                        smtp.send_message(msg, from_addr=sender, to_addrs=[to_addr, m["cc"]])
-                        log.append({**m, "status": "Gesendet", "error": ""})
-                    except Exception as e:
-                        log.append({**m, "status": "Fehler", "error": str(e)})
-                        raise
-            self.log_result(log)
-            self.status.set(f"{len(log)} E-Mail(s) erfolgreich versendet und protokolliert.")
-            messagebox.showinfo("Versand abgeschlossen", f"{len(log)} E-Mail(s) wurden versendet.")
-        except Exception as e:
+            day = local_weekday(); context = ssl.create_default_context()
+            attempted = 0
             try:
-                if 'log' in locals() and log:
-                    self.log_result(log)
+                with smtplib.SMTP(cfg["smtp_server"], int(cfg["smtp_port"]), timeout=30) as smtp:
+                    smtp.ehlo()
+                    if cfg.get("use_starttls", True): smtp.starttls(context=context); smtp.ehlo()
+                    smtp.login(cfg["username"], password)
+                    for m in messages:
+                        attempted += 1
+                        record = {**m, "day": day, "status": "Fehler", "error": "Diese E-Mail konnte nicht versendet werden."}
+                        try:
+                            msg = EmailMessage(); msg["From"] = cfg["sender"]; msg["To"] = m["to"]; msg["Cc"] = m["cc"]; msg["Subject"] = m["subject"]; msg.set_content(m["body"])
+                            smtp.send_message(msg, from_addr=cfg["sender"], to_addrs=[m["to"], m["cc"]])
+                            record.update(status="Gesendet", error="")
+                        except Exception:
+                            record["error"] = "Diese E-Mail konnte nicht versendet werden. Serverdetails werden aus Sicherheitsgründen nicht protokolliert."
+                        log.append(record)
             except Exception:
-                pass
+                # Preserve per-message outcomes, including connection/login failures, without logging raw SMTP errors.
+                for m in messages[attempted:]:
+                    log.append({**m, "day": day, "status": "Fehler", "error": "Verbindung oder Anmeldung beim SMTP-Server fehlgeschlagen."})
+            self.log_result(log)
+            failed = sum(e["status"] != "Gesendet" for e in log)
+            self.status.set(f"Versand abgeschlossen: {len(log)-failed} erfolgreich, {failed} fehlgeschlagen; protokolliert.")
+            messagebox.showinfo("Versand abgeschlossen", self.status.get())
+        except Exception as e:
+            # Do not expose SMTP/library exception text: it may contain sensitive details.
+            message = str(e) if isinstance(e, ValueError) else "SMTP-Verbindung oder Versand fehlgeschlagen. Zugangsdaten werden nicht angezeigt."
             self.status.set("Versand nicht vollständig abgeschlossen.")
-            messagebox.showerror("Versandfehler", str(e))
+            messagebox.showerror("Versandfehler", message)
+
 
 def main():
     root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
-        pass
-    MailPlanApp(root)
-    root.mainloop()
+    try: ttk.Style().theme_use("vista")
+    except tk.TclError: pass
+    MailPlanApp(root); root.mainloop()
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == "__main__": main()

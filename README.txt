@@ -1,34 +1,38 @@
-# Mailplanung – lokale Windows-Anwendung
+Mailplanung – lokale Windows-Anwendung
+========================================
 
-## Inhalt
-- `mailplanung.py`: grafische Anwendung
-- `Mailplanung_Vorlage_inhalt.xlsx`: deine Excel-Datei
-- `Start_Mailplanung.bat`: Startdatei für Windows
-- `requirements.txt`: benötigtes Python-Paket
+Enthaltene Dateien
+- mailplanung.py: Tkinter-Anwendung für Suche, Gruppierung, Vorschau und Versand
+- smtp_setup.py: interaktive SMTP-Ersteinrichtung mit verdeckter Passworteingabe
+- Mailplanung_Vorlage_inhalt.xlsx: bereitgestellte Excel-Datei
+- requirements.txt: benötigte Python-Pakete (openpyxl, cryptography)
+- Start_Mailplanung.bat und SMTP_Einrichten.bat: Windows-Startdateien
+- test_mailplanung.py: lokale Funktionstests ohne echte SMTP-Verbindungen
 
-## Start
-1. ZIP-Datei in einen eigenen Ordner entpacken.
-2. Python 3 installieren (bei der Installation „Add Python to PATH“ aktivieren).
-3. `Start_Mailplanung.bat` doppelklicken. Beim ersten Start wird `openpyxl` installiert.
-4. Die Excel-Datei wird automatisch geladen. Falls nötig, über „Durchsuchen“ auswählen.
+Einrichtung
+1. ZIP in einen eigenen Ordner entpacken.
+2. Python 3 für Windows installieren und beim Setup „Add Python to PATH“ aktivieren.
+3. SMTP_Einrichten.bat starten. Server, Port, Absender und Benutzername eingeben; das Passwort bleibt bei der Eingabe unsichtbar.
+4. Start_Mailplanung.bat starten. Die Pakete werden installiert und die Anwendung geöffnet.
 
-## Ablauf
-1. Personen über Vor- oder Nachnamen suchen.
-2. Eine oder mehrere Personen markieren und „Markierte hinzufügen“ klicken.
-3. Die Anwendung gruppiert die Auswahl automatisch nach Jahrgang.
-4. Für jeden Jahrgang wird genau eine E-Mail vorbereitet.
-5. Betreff und Nachricht kommen aus dem Blatt `Inhalt`. Im Nachrichtentext wird `{PERSONEN}` durch die ausgewählten Namen ersetzt. `{JAHRGANG}` kann ebenfalls verwendet werden.
-6. Der CC-Empfänger wird aus `Empfaenger` anhand von Wochentag und Jahrgang gelesen.
-7. Vorschau prüfen und erst danach „E-Mails senden“ wählen.
-8. Versandresultate werden im Blatt `Protokoll` eingetragen.
+SMTP-Einrichtung erzeugt mail_config.json und smtp_key.key. Das Passwort steht nur Fernet-verschlüsselt in der JSON-Datei. Der Schlüssel liegt separat. Schützen und sichern Sie beide Dateien gemeinsam; wer beide Dateien erhält, kann das Passwort entschlüsseln. Die Dateien sind in .gitignore eingetragen und werden nicht in das bereitgestellte ZIP übernommen. Legen Sie sie niemals in öffentlichen oder ungeschützten Ablagen ab.
 
-## SMTP-Einstellungen
-Für GMX sind üblicherweise `mail.gmx.net` und Port `587` mit STARTTLS passend. Bei anderen Anbietern die SMTP-Daten des Anbieters eintragen.
-- **An-Adresse:** Pflichtfeld. Da die Empfänger laut Vorgabe im CC stehen, wird diese Adresse in das Feld „An“ eingetragen.
-- **Absenderadresse / SMTP-Benutzername:** meist die eigene E-Mail-Adresse.
-- **SMTP-Passwort:** Bei Anbietern mit Zwei-Faktor-Anmeldung ein separates App-Passwort verwenden. Das Passwort wird nicht in der Konfigurationsdatei gespeichert.
+Arbeitsablauf
+1. Die Personen werden aus dem Tabellenblatt „Personen“ ab Zeile 2 geladen. Suche findet Vor- und Nachnamen sowie Jahrgang; Mehrfachauswahl ist möglich.
+2. Nach dem Hinzufügen werden Personen automatisch nach Jahrgang gruppiert.
+3. Je Jahrgang wird genau eine E-Mail vorbereitet. Betreff und Nachricht kommen aus der ersten ausgefüllten Datenzeile in „Inhalt“. Unterstützte Nachrichtsplatzhalter: {PERSONEN} und {JAHRGANG}.
+4. „An“ wird aus „Jahrgangsempfaenger“ nach Jahrgang gelesen. „CC“ kommt aus „Empfaenger“ passend zu lokalem aktuellem Wochentag und Jahrgang. Der Wochentag ist nicht in der Oberfläche auswählbar und wird beim Anzeigen bzw. Senden neu ermittelt.
+5. Tragen Sie die festen An-Adressen im neuen Blatt „Jahrgangsempfaenger“ ein. Das Blatt wird beim Laden ergänzt. Neue Jahrgänge werden hinzugefügt; vorhandene Adressen bleiben unangetastet.
+6. Vor dem Versand müssen für alle Gruppen An- und CC-Adressen vorhanden sein. Die Bestätigungsabfrage zeigt Anzahl und Empfänger jeder E-Mail.
+7. Versandresultate stehen im Blatt „Protokoll“ einschließlich Datum, Uhrzeit, Wochentag, Jahrgang, Anzahl, An, CC, Status und Fehlerhinweis. Zugangsdaten und rohe Serverfehler werden nicht protokolliert.
 
-## Sicherheit und Hinweise
-- Es wird nichts automatisch versendet. Vor dem Versand erscheint eine Bestätigungsabfrage.
-- Prüfe die Beispieladressen in `Empfaenger`: In der bereitgestellten Vorlage stehen offenbar Test-/Platzhalteradressen. Ersetze sie vor einem echten Versand durch die korrekten Adressen.
-- Die Excel-Datei wird beim Protokollieren geändert. Lege regelmäßig eine Sicherungskopie an.
+Wichtige Hinweise
+- Die Excel-Datei wird beim Laden um „Jahrgangsempfaenger“ ergänzt und beim Protokollieren geändert. Erstellen Sie regelmäßige Sicherungskopien.
+- Prüfen Sie vor dem echten Versand alle Empfängeradressen und den Nachrichtentext.
+- Für SMTP wird STARTTLS verwendet. Nutzen Sie bei aktivierter Mehr-Faktor-Anmeldung ggf. ein App-Passwort.
+- SMTP-Werte werden nicht in der Oberfläche angezeigt oder bearbeitet. Zur Aktualisierung SMTP_Einrichten.bat ausführen; vorhandene Konfiguration wird erst nach ausdrücklicher Bestätigung ersetzt.
+
+Funktionstests
+Mit installiertem Python und Abhängigkeiten im Programmordner ausführen:
+  python -m unittest test_mailplanung.py
+Die Tests prüfen Gruppierung, Platzhalter, Empfängerzuordnung, Wochentag und fehlende Adressen. Sie verwenden keinen SMTP-Server und senden keine E-Mails.
