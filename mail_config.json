@@ -1,0 +1,8 @@
+{
+  "smtp_server": "mail.gmx.net",
+  "smtp_port": 587,
+  "sender": "",
+  "username": "",
+  "to_address": "",
+  "use_starttls": true
+}
