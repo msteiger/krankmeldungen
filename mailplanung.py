@@ -22,7 +22,8 @@ LOG_HEADERS = ("Datum", "Uhrzeit", "Wochentag", "Jahrgang", "Anzahl Personen", "
 
 
 def local_weekday(now=None):
-    return WEEKDAYS[(now or datetime.now()).weekday()]
+    weekday = (now or datetime.now()).weekday()
+    return "Montag" if weekday >= 5 else WEEKDAYS[weekday]
 
 
 def ensure_recipient_sheet(workbook):
