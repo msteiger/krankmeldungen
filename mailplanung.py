@@ -101,8 +101,12 @@ def grouped_messages(selected, subject, template, to, cc, day):
     result = []
     for year in sorted(groups, key=str.casefold):
         people = sorted(groups[year], key=lambda p: (p["last"].casefold(), p["first"].casefold()))
-        result.append({"year": year, "count": len(people), "to": to.get(year, ""),
-                       "cc": cc.get((day, year), ""), "subject": subject,
+        to_address = to.get(year, "").strip()
+        cc_address = cc.get((day, year), "").strip()
+        # Do not deliver the same mailbox twice through To and Cc.
+        effective_cc = "" if to_address and cc_address and to_address.casefold() == cc_address.casefold() else cc_address
+        result.append({"year": year, "count": len(people), "to": to_address,
+                       "cc": effective_cc, "cc_configured": bool(cc_address), "subject": subject,
                        "body": template.replace("{PERSONEN}", ", ".join(p["first"] + " " + p["last"] for p in people)).replace("{JAHRGANG}", year)})
     return result
 
@@ -112,7 +116,7 @@ def validate_messages(messages):
     for m in messages:
         if not m["to"]:
             missing.append(f"Jahrgang {m['year']}: Hauptempfänger (An) fehlt.")
-        if not m["cc"]:
+        if not m.get("cc_configured", bool(m["cc"])):
             missing.append(f"Jahrgang {m['year']}: CC-Adresse für den aktuellen Wochentag fehlt.")
     if missing:
         raise ValueError("Versand nicht möglich:\n" + "\n".join(missing))
@@ -212,7 +216,8 @@ class MailPlanApp:
             self.preview.insert(tk.END, "Noch keine Personen ausgewählt.\n"); return
         try:
             for m in self.messages():
-                self.preview.insert(tk.END, f'Jahrgang {m["year"]} – {m["count"]} Person(en)\nAn: {m["to"] or "(fehlt)"}\nCC: {m["cc"] or "(fehlt)"}\nBetreff: {m["subject"]}\n{m["body"]}\n' + "─" * 55 + "\n")
+                cc_line = f'CC: {m["cc"]}\n' if m["cc"] else ""
+                self.preview.insert(tk.END, f'Jahrgang {m["year"]} – {m["count"]} Person(en)\nAn: {m["to"] or "(fehlt)"}\n' + cc_line + f'Betreff: {m["subject"]}\n{m["body"]}\n' + "─" * 55 + "\n")
         except Exception as e: self.preview.insert(tk.END, f"Vorschau nicht möglich: {e}\n")
 
     def log_result(self, entries):
@@ -232,7 +237,7 @@ class MailPlanApp:
         try:
             messages = self.messages(); validate_messages(messages)
             cfg, password = load_smtp_config()
-            summary = "\n".join(f'{m["year"]}: An {m["to"]}; CC {m["cc"]}' for m in messages)
+            summary = "\n".join(f'{m["year"]}: An {m["to"]}; CC {m["cc"] or "(keiner; identisch mit An)"}' for m in messages)
             if not messagebox.askyesno("Versand bestätigen", f"Es werden {len(messages)} E-Mail(s) versendet:\n\n{summary}\n\nMöchtest du wirklich senden?"):
                 return
             day = local_weekday(); context = ssl.create_default_context()
@@ -246,8 +251,10 @@ class MailPlanApp:
                         attempted += 1
                         record = {**m, "day": day, "status": "Fehler", "error": "Diese E-Mail konnte nicht versendet werden."}
                         try:
-                            msg = EmailMessage(); msg["From"] = cfg["sender"]; msg["To"] = m["to"]; msg["Cc"] = m["cc"]; msg["Subject"] = m["subject"]; msg.set_content(m["body"])
-                            smtp.send_message(msg, from_addr=cfg["sender"], to_addrs=[m["to"], m["cc"]])
+                            msg = EmailMessage(); msg["From"] = cfg["sender"]; msg["To"] = m["to"]
+                            if m["cc"]: msg["Cc"] = m["cc"]
+                            msg["Subject"] = m["subject"]; msg.set_content(m["body"])
+                            smtp.send_message(msg, from_addr=cfg["sender"], to_addrs=[m["to"]] + ([m["cc"]] if m["cc"] else []))
                             record.update(status="Gesendet", error="")
                         except Exception:
                             record["error"] = "Diese E-Mail konnte nicht versendet werden. Serverdetails werden aus Sicherheitsgründen nicht protokolliert."

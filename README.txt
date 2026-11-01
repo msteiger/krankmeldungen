@@ -21,7 +21,7 @@ Arbeitsablauf
 1. Die Personen werden aus dem Tabellenblatt „Personen“ ab Zeile 2 geladen. Suche findet Vor- und Nachnamen sowie Jahrgang; Mehrfachauswahl ist möglich.
 2. Nach dem Hinzufügen werden Personen automatisch nach Jahrgang gruppiert.
 3. Je Jahrgang wird genau eine E-Mail vorbereitet. Betreff und Nachricht kommen aus der ersten ausgefüllten Datenzeile in „Inhalt“. Unterstützte Nachrichtsplatzhalter: {PERSONEN} und {JAHRGANG}.
-4. „An“ wird aus „Jahrgangsempfaenger“ nach Jahrgang gelesen. „CC“ kommt aus „Empfaenger“ passend zu lokalem aktuellem Wochentag und Jahrgang. Der Wochentag ist nicht in der Oberfläche auswählbar und wird beim Anzeigen bzw. Senden neu ermittelt.
+4. „An“ wird aus „Jahrgangsempfaenger“ nach Jahrgang gelesen. „CC“ kommt aus „Empfaenger“ passend zu lokalem aktuellem Wochentag und Jahrgang. Ist die CC-Adresse identisch mit der An-Adresse, wird sie aus CC entfernt und nur einmal als An-Empfänger verwendet. Der Wochentag ist nicht in der Oberfläche auswählbar und wird beim Anzeigen bzw. Senden neu ermittelt.
 5. Tragen Sie die festen An-Adressen im neuen Blatt „Jahrgangsempfaenger“ ein. Das Blatt wird beim Laden ergänzt. Neue Jahrgänge werden hinzugefügt; vorhandene Adressen bleiben unangetastet.
 6. Vor dem Versand müssen für alle Gruppen An- und CC-Adressen vorhanden sein. Die Bestätigungsabfrage zeigt Anzahl und Empfänger jeder E-Mail.
 7. Versandresultate stehen im Blatt „Protokoll“ einschließlich Datum, Uhrzeit, Wochentag, Jahrgang, Anzahl, An, CC, Status und Fehlerhinweis. Zugangsdaten und rohe Serverfehler werden nicht protokolliert.
