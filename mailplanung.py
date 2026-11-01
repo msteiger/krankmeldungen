@@ -144,9 +144,15 @@ class MailPlanApp:
         ttk.Label(left, text="Vorname oder Nachname:").pack(anchor="w", padx=8, pady=(8, 0))
         ttk.Entry(left, textvariable=self.search).pack(fill="x", padx=8)
         self.search.trace_add("write", lambda *_: self.refresh_people())
-        self.people_list = tk.Listbox(left, selectmode="extended", exportselection=False); self.people_list.pack(fill="both", expand=True, padx=8, pady=8)
+        self.people_list = ttk.Treeview(left, columns=("first", "last", "year"), show="headings", selectmode="extended")
+        for col, title, width in (("first", "Vorname", 120), ("last", "Nachname", 150), ("year", "Jahrgang", 85)):
+            self.people_list.heading(col, text=title); self.people_list.column(col, width=width, minwidth=60, stretch=True)
+        self.people_list.pack(fill="both", expand=True, padx=8, pady=8)
         ttk.Button(left, text="Hinzufügen →", command=self.add_people).pack(anchor="e", padx=8, pady=(0, 8))
-        self.selected_list = tk.Listbox(right, selectmode="extended", exportselection=False); self.selected_list.pack(fill="both", expand=True, padx=8, pady=8)
+        self.selected_list = ttk.Treeview(right, columns=("first", "last", "year"), show="headings", selectmode="extended")
+        for col, title, width in (("first", "Vorname", 120), ("last", "Nachname", 150), ("year", "Jahrgang", 85)):
+            self.selected_list.heading(col, text=title); self.selected_list.column(col, width=width, minwidth=60, stretch=True)
+        self.selected_list.pack(fill="both", expand=True, padx=8, pady=8)
         ttk.Button(right, text="Markierte entfernen", command=self.remove_people).pack(anchor="e", padx=8, pady=(0, 8))
         preview_frame = ttk.LabelFrame(outer, text="E-Mail-Vorschau (eine E-Mail pro Jahrgang)"); preview_frame.pack(fill="both", expand=True)
         self.preview = tk.Text(preview_frame, height=12, wrap="word"); self.preview.pack(fill="both", expand=True, padx=8, pady=8)
@@ -171,24 +177,28 @@ class MailPlanApp:
 
     def refresh_people(self):
         if not hasattr(self, "people_list"): return
-        q = self.search.get().strip().casefold(); self.people_list.delete(0, tk.END); self.visible_people = []
+        q = self.search.get().strip().casefold()
+        for item in self.people_list.get_children(): self.people_list.delete(item)
+        self.visible_people = []
         for p in self.people:
             if p["id"] not in self.selected and q in (p["first"] + " " + p["last"] + " " + p["year"]).casefold():
-                self.visible_people.append(p); self.people_list.insert(tk.END, f'{p["first"]} {p["last"]} — {p["year"]}')
+                self.visible_people.append(p); self.people_list.insert("", tk.END, values=(p["first"], p["last"], p["year"]))
 
     def refresh_selected(self):
         if not hasattr(self, "selected_list"): return
-        self.selected_list.delete(0, tk.END)
+        for item in self.selected_list.get_children(): self.selected_list.delete(item)
         self.visible_selected = sorted(self.selected.values(), key=lambda p: (p["year"].casefold(), p["last"].casefold(), p["first"].casefold()))
-        for p in self.visible_selected: self.selected_list.insert(tk.END, f'{p["year"]}: {p["first"]} {p["last"]}')
+        for p in self.visible_selected: self.selected_list.insert("", tk.END, values=(p["first"], p["last"], p["year"]))
 
     def add_people(self):
-        for i in self.people_list.curselection():
-            p = self.visible_people[i]; self.selected[p["id"]] = p
+        rows = self.people_list.selection()
+        for row in rows:
+            p = self.visible_people[self.people_list.index(row)]; self.selected[p["id"]] = p
         self.refresh_people(); self.refresh_selected(); self.update_preview()
 
     def remove_people(self):
-        for i in reversed(self.selected_list.curselection()): self.selected.pop(self.visible_selected[i]["id"], None)
+        for row in self.selected_list.selection():
+            i = self.selected_list.index(row); self.selected.pop(self.visible_selected[i]["id"], None)
         self.refresh_people(); self.refresh_selected(); self.update_preview()
 
     def messages(self):
